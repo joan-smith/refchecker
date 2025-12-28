@@ -418,10 +418,161 @@ class EnhancedHybridReferenceChecker:
         else:
             logger.debug("Enhanced Hybrid: All available APIs failed to verify reference")
             
-        return None, [{
-            'error_type': 'unverified',
-            'error_details': 'Could not verify reference using any available API'
-        }], None
+        return None, [{'error_type': 'unverified', 'error_details': 'Could not verify reference using any available API'}], None
+    
+    def verify_references_batch(self, references: List[Dict[str, Any]]) -> Tuple[List[Tuple[Optional[Dict], bool, str]], Dict[str, int]]:
+        """
+        Verify multiple references efficiently using batch API calls.
+        
+        Strategy:
+        1. Use OpenAlex batch search for all titles (most efficient)
+        2. Use Semantic Scholar batch for papers not found in OpenAlex  
+        3. Fall back to individual verification for remaining papers
+        
+        Args:
+            references: List of reference dicts, each with 'title', 'year', 'authors', 'url'
+            
+        Returns:
+            Tuple of:
+            - List of (verified_paper, is_valid, reason) tuples, one per input
+            - Stats dict with 'total', 'verified', 'not_found', 'throttled' counts
+        """
+        logger.info(f"Enhanced Hybrid: Starting batch verification for {len(references)} papers")
+        
+        stats = {
+            'total': len(references),
+            'verified': 0,
+            'not_found': 0,
+            'throttled': 0,
+            'openalex_found': 0,
+            'semantic_scholar_found': 0,
+            'individual_fallback': 0
+        }
+        
+        # Results list to match input order
+        results = [None] * len(references)
+        unfound_indices = list(range(len(references)))
+        
+        # PHASE 1: Try OpenAlex batch search (most efficient - can handle 20+ titles per call)
+        if self.openalex and hasattr(self.openalex, 'search_works_batch'):
+            logger.info("Enhanced Hybrid: Phase 1 - OpenAlex batch search")
+            try:
+                openalex_results, openalex_stats = self.openalex.search_works_batch(references)
+                stats['throttled'] += openalex_stats.get('throttled', 0)
+                
+                # Process OpenAlex results
+                for idx in list(unfound_indices):
+                    work_data = openalex_results.get(idx)
+                    if work_data:
+                        # Extract URL and build result
+                        url = self.openalex.extract_url_from_work(work_data) if hasattr(self.openalex, 'extract_url_from_work') else None
+                        paper = references[idx].copy()
+                        paper['url'] = url
+                        paper['title'] = work_data.get('title', work_data.get('display_name', paper.get('title')))
+                        paper['link_valid'] = True
+                        paper['external_ids'] = work_data.get('ids', {})
+                        
+                        results[idx] = (paper, True, "Verified by OpenAlex batch")
+                        stats['verified'] += 1
+                        stats['openalex_found'] += 1
+                        unfound_indices.remove(idx)
+                
+                logger.info(f"Enhanced Hybrid: OpenAlex batch found {stats['openalex_found']}/{len(references)} papers")
+                
+            except Exception as e:
+                logger.warning(f"Enhanced Hybrid: OpenAlex batch search failed: {e}")
+        
+        # PHASE 2: Try Semantic Scholar batch for remaining papers
+        if unfound_indices and self.semantic_scholar and hasattr(self.semantic_scholar, 'search_papers_batch'):
+            logger.info(f"Enhanced Hybrid: Phase 2 - Semantic Scholar batch search for {len(unfound_indices)} remaining papers")
+            
+            # Build subset of references for unfound indices
+            unfound_refs = [references[i] for i in unfound_indices]
+            
+            try:
+                ss_results, ss_stats = self.semantic_scholar.search_papers_batch(unfound_refs)
+                stats['throttled'] += ss_stats.get('throttled', 0)
+                
+                # Process Semantic Scholar results
+                for i, idx in enumerate(unfound_indices[:]):  # Copy to allow modification
+                    paper_data = ss_results.get(i)
+                    if paper_data:
+                        # Extract URL from paper data
+                        external_ids = paper_data.get('externalIds', {})
+                        url = None
+                        
+                        # Priority: PubMed > DOI > arXiv > Semantic Scholar URL
+                        if external_ids.get('PubMed') or external_ids.get('PMID'):
+                            pmid = external_ids.get('PubMed') or external_ids.get('PMID')
+                            url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                        elif external_ids.get('DOI'):
+                            url = f"https://doi.org/{external_ids['DOI']}"
+                        elif paper_data.get('openAccessPdf', {}).get('url'):
+                            url = paper_data['openAccessPdf']['url']
+                        elif external_ids.get('ArXiv'):
+                            url = f"https://arxiv.org/abs/{external_ids['ArXiv']}"
+                        elif paper_data.get('url'):
+                            url = paper_data['url']
+                        
+                        if url:
+                            paper = references[idx].copy()
+                            paper['url'] = url
+                            paper['title'] = paper_data.get('title', paper.get('title'))
+                            paper['link_valid'] = True
+                            paper['external_ids'] = external_ids
+                            
+                            results[idx] = (paper, True, "Verified by Semantic Scholar batch")
+                            stats['verified'] += 1
+                            stats['semantic_scholar_found'] += 1
+                            unfound_indices.remove(idx)
+                
+                logger.info(f"Enhanced Hybrid: Semantic Scholar batch found {stats['semantic_scholar_found']} more papers")
+                
+            except Exception as e:
+                logger.warning(f"Enhanced Hybrid: Semantic Scholar batch search failed: {e}")
+        
+        # PHASE 3: Individual fallback for remaining papers (if any)
+        if unfound_indices:
+            logger.info(f"Enhanced Hybrid: Phase 3 - Individual verification for {len(unfound_indices)} remaining papers")
+            
+            for idx in unfound_indices:
+                ref = references[idx]
+                try:
+                    verified_data, errors, url = self.verify_reference(ref)
+                    
+                    if verified_data and url:
+                        paper = ref.copy()
+                        paper['url'] = url
+                        paper['title'] = verified_data.get('title', paper.get('title'))
+                        paper['link_valid'] = True
+                        paper['external_ids'] = verified_data.get('externalIds', {})
+                        
+                        results[idx] = (paper, True, "Verified by individual API call")
+                        stats['verified'] += 1
+                        stats['individual_fallback'] += 1
+                    else:
+                        # Not found
+                        error_msg = "No valid URL found" if errors else "Paper not found in any API"
+                        results[idx] = (ref, False, f"Verification failed: {error_msg}")
+                        stats['not_found'] += 1
+                        
+                except Exception as e:
+                    results[idx] = (ref, False, f"Exception during verification: {e}")
+                    stats['not_found'] += 1
+        
+        # Mark any remaining None results as not found
+        for idx, result in enumerate(results):
+            if result is None:
+                results[idx] = (references[idx], False, "Verification failed: Paper not found")
+                stats['not_found'] += 1
+        
+        logger.info(f"Enhanced Hybrid: Batch verification complete - "
+                   f"{stats['verified']}/{stats['total']} verified "
+                   f"(OpenAlex: {stats['openalex_found']}, S2: {stats['semantic_scholar_found']}, "
+                   f"Individual: {stats['individual_fallback']}), "
+                   f"Not found: {stats['not_found']}, Throttled: {stats['throttled']}")
+        
+        return results, stats
     
     def _try_openreview_search(self, reference: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], Optional[str], bool, str]:
         """

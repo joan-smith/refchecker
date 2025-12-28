@@ -122,6 +122,116 @@ class NonArxivReferenceChecker:
         self._failure_reason = "rate_limited_or_timeout"
         return []
     
+    def search_papers_batch(self, references: List[Dict[str, Any]]) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, int]]:
+        """
+        Search for multiple papers using S2 bulk search endpoint.
+        
+        Uses GET /graph/v1/paper/search/bulk with combined OR query
+        to minimize API calls and avoid rate limiting.
+        
+        Args:
+            references: List of reference dicts, each with 'title', 'year', 'authors'
+            
+        Returns:
+            Tuple of:
+            - Dict mapping reference_index -> best matching paper data (or None)
+            - Stats dict with 'found', 'not_found', 'throttled' counts
+        """
+        from utils.text_utils import clean_title_for_search, find_best_match
+        from urllib.parse import quote_plus
+        
+        results = {}
+        stats = {'found': 0, 'not_found': 0, 'throttled': 0, 'total': len(references)}
+        
+        # Build cleaned titles for matching
+        cleaned_titles = []
+        for ref in references:
+            title = ref.get('title', '')
+            if title:
+                cleaned_titles.append(clean_title_for_search(title))
+            else:
+                cleaned_titles.append('')
+        
+        # Build OR query with quoted exact titles for best matching
+        # S2 bulk search accepts OR queries: "title one" | "title two"
+        title_queries = []
+        for cleaned in cleaned_titles:
+            if cleaned:
+                # Use first 8 words of title to avoid overly long queries
+                words = cleaned.split()[:8]
+                title_queries.append(' '.join(words))
+        
+        if not title_queries:
+            # No valid titles
+            for idx in range(len(references)):
+                results[idx] = None
+                stats['not_found'] += 1
+            return results, stats
+        
+        # S2 bulk search endpoint - single API call for all titles
+        endpoint = f"{self.base_url}/paper/search/bulk"
+        
+        # Combine titles into OR query (S2 uses | for OR in query param)
+        # Limit to avoid URL length issues
+        combined_query = ' | '.join([f'"{t}"' for t in title_queries[:20]])
+        
+        params = {
+            "query": combined_query,
+            "limit": min(len(references) * 3, 100),  # Get extra results for matching
+            "fields": "title,authors,year,externalIds,url,abstract,openAccessPdf,isOpenAccess,venue,journal"
+        }
+        
+        logger.debug(f"S2 bulk search query: {combined_query[:100]}...")
+        
+        api_results = []
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.get(endpoint, headers=self.headers, params=params, timeout=60)
+                
+                if response.status_code == 429:
+                    wait_time = self.request_delay * (self.backoff_factor ** attempt) + 1
+                    logger.debug(f"S2 bulk rate limited. Retrying in {wait_time:.1f}s...")
+                    stats['throttled'] += 1
+                    time.sleep(wait_time)
+                    continue
+                
+                response.raise_for_status()
+                data = response.json()
+                api_results = data.get('data', [])
+                logger.debug(f"S2 bulk search returned {len(api_results)} results")
+                break
+                
+            except requests.exceptions.RequestException as e:
+                wait_time = self.request_delay * (self.backoff_factor ** attempt) + 1
+                logger.debug(f"S2 bulk request failed: {e}. Retrying...")
+                time.sleep(wait_time)
+        
+        # Match results to original references
+        for idx, ref in enumerate(references):
+            title = ref.get('title', '')
+            year = ref.get('year')
+            authors = ref.get('authors', [])
+            
+            if not title:
+                results[idx] = None
+                stats['not_found'] += 1
+                continue
+            
+            cleaned = cleaned_titles[idx]
+            best_match, best_score = find_best_match(api_results, cleaned, year, authors)
+            
+            if best_match and best_score >= SIMILARITY_THRESHOLD:
+                results[idx] = best_match
+                stats['found'] += 1
+                logger.debug(f"S2 Batch: Found match for '{title[:40]}...' with score {best_score:.2f}")
+            else:
+                results[idx] = None
+                stats['not_found'] += 1
+                logger.debug(f"S2 Batch: No match for '{title[:40]}...' (best score: {best_score:.2f})")
+        
+        logger.info(f"S2 bulk search complete: {stats['found']}/{stats['total']} found, {stats['throttled']} throttle events")
+        return results, stats
+    
     def get_paper_by_doi(self, doi: str) -> Optional[Dict[str, Any]]:
         """
         Get paper data by DOI

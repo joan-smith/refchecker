@@ -126,6 +126,113 @@ class OpenAlexReferenceChecker:
         logger.debug(f"Failed to search OpenAlex after {self.max_retries} attempts")
         return []
     
+    def search_works_batch(self, references: List[Dict[str, Any]], batch_size: int = 20) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, int]]:
+        """
+        Search for multiple works by title in batched API calls.
+        
+        Uses OpenAlex title.search filter with pipe-separated titles.
+        Due to URL length limits, batches are limited to ~20 titles per request.
+        
+        Args:
+            references: List of reference dicts, each with 'title', 'year', 'authors'
+            batch_size: Max titles per API call (default 20 to avoid URL length issues)
+            
+        Returns:
+            Tuple of:
+            - Dict mapping reference_index -> best matching work data (or None)
+            - Stats dict with 'found', 'not_found', 'throttled' counts
+        """
+        from utils.text_utils import clean_title_for_search, find_best_match
+        
+        results = {}
+        stats = {'found': 0, 'not_found': 0, 'throttled': 0, 'total': len(references)}
+        
+        # Process in batches
+        for batch_start in range(0, len(references), batch_size):
+            batch_end = min(batch_start + batch_size, len(references))
+            batch_refs = references[batch_start:batch_end]
+            batch_indices = list(range(batch_start, batch_end))
+            
+            # Build pipe-separated title search query
+            cleaned_titles = []
+            for ref in batch_refs:
+                title = ref.get('title', '')
+                if title:
+                    cleaned = clean_title_for_search(title)
+                    cleaned_titles.append(cleaned)
+                else:
+                    cleaned_titles.append('')
+            
+            # URL-encode and join titles with pipe
+            # Note: OpenAlex title.search with pipe acts as OR
+            search_query = '|'.join([quote_plus(t) for t in cleaned_titles if t])
+            
+            if not search_query:
+                # No valid titles in batch
+                for idx in batch_indices:
+                    results[idx] = None
+                    stats['not_found'] += 1
+                continue
+            
+            endpoint = f"{self.base_url}/works"
+            params = {
+                "filter": f"title.search:{search_query}",
+                "per_page": min(batch_size * 3, 100),  # Get extra results for matching
+                "select": "id,doi,title,display_name,publication_year,authorships,type,open_access,primary_location,locations,referenced_works,ids"
+            }
+            
+            # Make the request with retries
+            api_results = []
+            for attempt in range(self.max_retries):
+                try:
+                    time.sleep(self.request_delay)
+                    response = requests.get(endpoint, headers=self.headers, params=params, timeout=30)
+                    
+                    if response.status_code == 429:
+                        wait_time = self.request_delay * (self.backoff_factor ** attempt) + 1
+                        logger.debug(f"OpenAlex batch rate limited. Retrying in {wait_time:.2f}s...")
+                        stats['throttled'] += 1
+                        time.sleep(wait_time)
+                        continue
+                    
+                    response.raise_for_status()
+                    data = response.json()
+                    api_results = data.get('results', [])
+                    logger.debug(f"OpenAlex batch search returned {len(api_results)} results for {len(batch_refs)} titles")
+                    break
+                    
+                except requests.exceptions.RequestException as e:
+                    wait_time = self.request_delay * (self.backoff_factor ** attempt) + 1
+                    logger.debug(f"OpenAlex batch request failed: {e}. Retrying...")
+                    time.sleep(wait_time)
+            
+            # Match results to original references
+            for i, (idx, ref) in enumerate(zip(batch_indices, batch_refs)):
+                title = ref.get('title', '')
+                year = ref.get('year')
+                authors = ref.get('authors', [])
+                
+                if not title:
+                    results[idx] = None
+                    stats['not_found'] += 1
+                    continue
+                
+                cleaned_title = cleaned_titles[i]
+                best_match, best_score = find_best_match(api_results, cleaned_title, year, authors)
+                
+                if best_match and best_score >= SIMILARITY_THRESHOLD:
+                    results[idx] = best_match
+                    stats['found'] += 1
+                    logger.debug(f"Batch: Found match for '{title[:40]}...' with score {best_score:.2f}")
+                else:
+                    results[idx] = None
+                    stats['not_found'] += 1
+                    logger.debug(f"Batch: No match for '{title[:40]}...' (best score: {best_score:.2f})")
+        
+        logger.info(f"OpenAlex batch search complete: {stats['found']}/{stats['total']} found, {stats['throttled']} throttle events")
+        return results, stats
+
+    
     def get_work_by_doi(self, doi: str) -> Optional[Dict[str, Any]]:
         """
         Get work data by DOI
