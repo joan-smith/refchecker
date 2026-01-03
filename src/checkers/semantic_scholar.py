@@ -30,6 +30,7 @@ import re
 from typing import Dict, List, Tuple, Optional, Any, Union
 from utils.text_utils import normalize_text, clean_title_basic, find_best_match, is_name_match, are_venues_substantially_different, calculate_title_similarity, compare_authors, clean_title_for_search, strip_latex_commands, compare_titles_with_latex_cleaning
 from utils.error_utils import format_title_mismatch
+from utils.s2_rate_limiter import get_s2_limiter
 from config.settings import get_config
 
 # Set up logging
@@ -59,10 +60,9 @@ class NonArxivReferenceChecker:
         if api_key:
             self.headers["x-api-key"] = api_key
         
-        # Rate limiting parameters
-        self.request_delay = 1.0  # Initial delay between requests (seconds)
+        # Rate limiting - use global limiter for cross-thread coordination
+        self._rate_limiter = get_s2_limiter()
         self.max_retries = 5  # Sufficient for individual API calls
-        self.backoff_factor = 2  # Exponential backoff factor
         
         # Track API failures for Enhanced Hybrid Checker
         self._api_failed = False
@@ -92,17 +92,23 @@ class NonArxivReferenceChecker:
         # Reduce retries for ArXiv ID searches to avoid unnecessary API calls when mismatch is likely
         max_retries_for_this_query = 2 if "arXiv:" in query else self.max_retries
         
-        # Make the request with retries and backoff
+        # Make the request with retries using global rate limiter
         for attempt in range(max_retries_for_this_query):
             try:
+                # Wait for global rate limit slot
+                self._rate_limiter.wait_for_slot()
+                
                 response = requests.get(endpoint, headers=self.headers, params=params)
+                logger.info(f"S2 API: search_paper query='{query[:50]}...' -> {response.status_code}")
                 
                 # Check for rate limiting
                 if response.status_code == 429:
-                    wait_time = self.request_delay * (self.backoff_factor ** attempt)
-                    logger.debug(f"Rate limit exceeded. Increasing delay and retrying...")
-                    time.sleep(wait_time)
+                    self._rate_limiter.record_throttle()
+                    logger.debug(f"Rate limit exceeded. Global backoff applied, retrying...")
                     continue
+                
+                # Success - help decay backoff
+                self._rate_limiter.record_success()
                 
                 # Check for other errors
                 response.raise_for_status()
@@ -112,9 +118,7 @@ class NonArxivReferenceChecker:
                 return data.get('data', [])
                 
             except requests.exceptions.RequestException as e:
-                wait_time = self.request_delay * (self.backoff_factor ** attempt)
-                logger.warning(f"Request failed: {str(e)}. Retrying in {wait_time:.2f} seconds...")
-                time.sleep(wait_time)
+                logger.warning(f"Request failed: {str(e)}. Retrying...")
         
         # If we get here, all retries failed
         logger.debug(f"Failed to search for paper after {self.max_retries} attempts")
@@ -186,14 +190,20 @@ class NonArxivReferenceChecker:
         api_results = []
         for attempt in range(self.max_retries):
             try:
+                # Wait for global rate limit slot
+                self._rate_limiter.wait_for_slot()
+                
                 response = requests.get(endpoint, headers=self.headers, params=params, timeout=60)
+                logger.info(f"S2 API: search_papers_batch -> {response.status_code}")
                 
                 if response.status_code == 429:
-                    wait_time = self.request_delay * (self.backoff_factor ** attempt) + 1
-                    logger.debug(f"S2 bulk rate limited. Retrying in {wait_time:.1f}s...")
+                    self._rate_limiter.record_throttle()
+                    logger.debug(f"S2 bulk rate limited. Global backoff applied, retrying...")
                     stats['throttled'] += 1
-                    time.sleep(wait_time)
                     continue
+                
+                # Success - help decay backoff
+                self._rate_limiter.record_success()
                 
                 response.raise_for_status()
                 data = response.json()
@@ -202,9 +212,7 @@ class NonArxivReferenceChecker:
                 break
                 
             except requests.exceptions.RequestException as e:
-                wait_time = self.request_delay * (self.backoff_factor ** attempt) + 1
                 logger.debug(f"S2 bulk request failed: {e}. Retrying...")
-                time.sleep(wait_time)
         
         # Match results to original references
         for idx, ref in enumerate(references):
@@ -248,17 +256,23 @@ class NonArxivReferenceChecker:
             "fields": "title,authors,year,externalIds,url,abstract,openAccessPdf,isOpenAccess,venue,journal"
         }
         
-        # Make the request with retries and backoff
+        # Make the request with retries using global rate limiter
         for attempt in range(self.max_retries):
             try:
+                # Wait for global rate limit slot
+                self._rate_limiter.wait_for_slot()
+                
                 response = requests.get(endpoint, headers=self.headers, params=params)
+                logger.info(f"S2 API: get_paper_by_doi doi='{doi}' -> {response.status_code}")
                 
                 # Check for rate limiting
                 if response.status_code == 429:
-                    wait_time = self.request_delay * (self.backoff_factor ** attempt)
-                    logger.debug(f"Rate limit exceeded. Increasing delay and retrying...")
-                    time.sleep(wait_time)
+                    self._rate_limiter.record_throttle()
+                    logger.debug(f"Rate limit exceeded. Global backoff applied, retrying...")
                     continue
+                
+                # Success - help decay backoff
+                self._rate_limiter.record_success()
                 
                 # If not found, return None
                 if response.status_code == 404:
@@ -272,9 +286,7 @@ class NonArxivReferenceChecker:
                 return response.json()
                 
             except requests.exceptions.RequestException as e:
-                wait_time = self.request_delay * (self.backoff_factor ** attempt)
-                logger.warning(f"Request failed: {str(e)}. Retrying in {wait_time:.2f} seconds...")
-                time.sleep(wait_time)
+                logger.warning(f"Request failed: {str(e)}. Retrying...")
         
         # If we get here, all retries failed
         logger.error(f"Failed to get paper by DOI after {self.max_retries} attempts")
@@ -374,13 +386,19 @@ class NonArxivReferenceChecker:
                 
                 for attempt in range(self.max_retries):
                     try:
+                        # Wait for global rate limit slot
+                        self._rate_limiter.wait_for_slot()
+                        
                         response = requests.get(endpoint, headers=self.headers, params=params)
+                        logger.info(f"S2 API: verify_reference CorpusID={corpus_id} -> {response.status_code}")
                         
                         if response.status_code == 429:
-                            wait_time = self.request_delay * (self.backoff_factor ** attempt)
-                            logger.debug(f"Rate limit exceeded. Retrying in {wait_time}s...")
-                            time.sleep(wait_time)
+                            self._rate_limiter.record_throttle()
+                            logger.debug(f"Rate limit exceeded. Global backoff applied, retrying...")
                             continue
+                        
+                        # Success - help decay backoff
+                        self._rate_limiter.record_success()
                         
                         if response.status_code == 200:
                             paper_data = response.json()
@@ -397,8 +415,6 @@ class NonArxivReferenceChecker:
                         logger.warning(f"Request failed for CorpusID {corpus_id}: {e}")
                         if attempt == self.max_retries - 1:
                             break
-                        else:
-                            time.sleep(self.request_delay * (self.backoff_factor ** attempt))
         
         # Initialize DOI variable for later use
         doi = None

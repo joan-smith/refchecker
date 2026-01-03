@@ -499,7 +499,7 @@ class EnhancedHybridReferenceChecker:
             
             # Retry loop with exponential backoff for throttling
             max_batch_retries = 3
-            batch_backoff = 2.0  # Start with 2 seconds
+            batch_backoff = 10.0  # Start with 10 seconds (aggressive backoff)
             
             for batch_attempt in range(max_batch_retries):
                 try:
@@ -552,7 +552,7 @@ class EnhancedHybridReferenceChecker:
                     
                     if is_throttle and batch_attempt < max_batch_retries - 1:
                         # Exponential backoff with jitter
-                        wait_time = batch_backoff * (2 ** batch_attempt) + random.random()
+                        wait_time = max(5.0, batch_backoff * (2 ** batch_attempt) + random.random())
                         print(f"      ⚠️ S2 batch throttled, waiting {wait_time:.1f}s before retry {batch_attempt + 2}/{max_batch_retries}")
                         logger.warning(f"Enhanced Hybrid: S2 batch throttled, retrying in {wait_time:.1f}s")
                         time.sleep(wait_time)
